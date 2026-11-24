@@ -45,6 +45,9 @@ namespace FireEscape.Core
     /// <summary>Port of python/sim/generator.py. Same steps and meaning; random numbers differ from numpy.</summary>
     public static class TerrainGenerator
     {
+        // Feature sizes in metres (not cells), so slopes do not depend on map resolution. Same as in Python.
+        const double HillScaleM = 855, RegionEdgeM = 128, RidgeScaleM = 395, ValleyScaleM = 640, ValleySmoothM = 51, CoverScaleM = 160;
+
         /// <summary>New random map. usedSeed is the seed actually used (also in map.Name), to repeat a map.</summary>
         public static GridMap Generate(TerrainSettings p, out int usedSeed)
         {
@@ -53,7 +56,8 @@ namespace FireEscape.Core
             usedSeed = p.Seed >= 0 ? p.Seed : new Random().Next(0, 1000000);
             var rng = new Random(usedSeed);
             int n = p.Size; double h = p.CellSize;
-            double scale = Math.Max(n / 6.0, 2);
+            Func<double, double, double> cells = (metres, least) => Math.Max(metres / h, least);
+            double scale = cells(HillScaleM, 2);
 
             // Base: gentle hills.
             double[] z = Noise.Fractal(n, .1 * p.ReliefM, rng, 5, scale);
@@ -61,19 +65,19 @@ namespace FireEscape.Core
             // Ridges on RidgeShare of the area, with a soft edge of the region.
             double[] region = Noise.Fractal(n, 1, rng, 3, scale);
             double[] soft = Mask(region, p.RidgeShare);
-            Noise.Blur(soft, n, Math.Max(n / 40.0, 1));
-            double[] ridged = Noise.Ridged(n, 1, rng, 6, Math.Max(n / 13.0, 2));
+            Noise.Blur(soft, n, cells(RegionEdgeM, 1));
+            double[] ridged = Noise.Ridged(n, 1, rng, 6, cells(RidgeScaleM, 2));
             for (int i = 0; i < z.Length; i++) z[i] += soft[i] * ridged[i] * p.ReliefM;
 
             // Valleys: cells near zero crossings of a noise field form winding lines; cut terrain there.
             if (p.ValleyShare > 0)
             {
-                double[] v = Noise.Fractal(n, 1, rng, 3, Math.Max(n / 8.0, 2));
+                double[] v = Noise.Fractal(n, 1, rng, 3, cells(ValleyScaleM, 2));
                 for (int i = 0; i < v.Length; i++) v[i] = Math.Abs(v[i]);
                 double q = Quantile(v, p.ValleyShare);
                 var profile = new double[v.Length];
                 if (q > 0) for (int i = 0; i < v.Length; i++) profile[i] = Math.Sqrt(Math.Max(0, 1 - v[i] / q));
-                Noise.Blur(profile, n, Math.Max(n / 100.0, 1));
+                Noise.Blur(profile, n, cells(ValleySmoothM, 1));
                 for (int i = 0; i < z.Length; i++) z[i] -= profile[i] * .25 * p.ReliefM;
             }
 
@@ -93,19 +97,19 @@ namespace FireEscape.Core
             }
             for (int i = 0; i < z.Length; i++) z[i] -= level;   // water surface at 0 m, as on real maps
 
-            byte[] cover = Cover(z, water, p, rng, n);
+            byte[] cover = Cover(z, water, p, rng, n, cells(CoverScaleM, 1));
             GridMap map = TerrainBuilder.Build(n, n, h, z, cover, p.MaxSlopeDeg);
             map.Name = "nasumicna_" + usedSeed;
             return map;
         }
 
         /// <summary>Land cover: lowest land forest, then shrub (makija), then grass; the highest is bare.</summary>
-        static byte[] Cover(double[] z, bool[] water, TerrainSettings p, Random rng, int n)
+        static byte[] Cover(double[] z, bool[] water, TerrainSettings p, Random rng, int n, double noiseScale)
         {
             double lo = double.PositiveInfinity, hi = double.NegativeInfinity;
             for (int i = 0; i < z.Length; i++) if (!water[i]) { lo = Math.Min(lo, z[i]); hi = Math.Max(hi, z[i]); }
             double span = hi - lo > 0 ? hi - lo : 1;
-            double[] noise = Noise.Fractal(n, 1, rng, 5, 16);
+            double[] noise = Noise.Fractal(n, 1, rng, 5, noiseScale);
             var land = new List<int>();
             var r = new double[z.Length];
             for (int i = 0; i < z.Length; i++) if (!water[i]) { land.Add(i); r[i] = (z[i] - lo) / span + .1 * noise[i]; }

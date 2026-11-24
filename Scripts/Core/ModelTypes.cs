@@ -85,8 +85,8 @@ namespace FireEscape.Core
         public double BaseSpeed = 1.35, SpeedSigma = .15, Stress = .3, Familiarity = .75, RiskAversion = 4;
         public double SmokeStrength = 1, ReactionDelay = 30, ReactionJitter = 15, DecisionNoise = .15;
         // Landscape-scale synthetic fire: radii in metres, growth in metres per second.
-        public double FireStartRadius = 25, FireGrowth = .15, SmokeRadius = 150, SmokeGrowth = .5;
-        public double TimeStep = .5, Horizon = 1800, SnapshotInterval = 5;
+        public double FireStartRadius = 25, FireGrowth = .15, SmokeRadius = 100, SmokeGrowth = .2;
+        public double TimeStep = .5, Horizon = 3600, SnapshotInterval = 5;
         public int Seed = 12345;
         public ModelSettings Clone() { return (ModelSettings)MemberwiseClone(); }
         public void Validate()
