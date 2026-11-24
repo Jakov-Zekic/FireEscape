@@ -13,16 +13,18 @@ namespace FireEscape
         public bool TopDown;
         public float MapWidth = 36f;
         public float MapDepth = 26f;
+        public float MinHeight, MaxHeight;
+        float Extent { get { return Mathf.Max(MapWidth, MapDepth, 1f); } }
         private Camera view;
         private Vector3 previousMouse;
         private bool mouseInitialised;
 
         private void Awake() { view = GetComponent<Camera>(); }
 
-        public void ResetView(float width, float depth, bool topDown)
+        public void ResetView(float width, float depth, float minHeight, float maxHeight, bool topDown)
         {
-            MapWidth = width; MapDepth = depth;
-            Target = new Vector3(width * .5f, .5f, depth * .5f);
+            MapWidth = width; MapDepth = depth; MinHeight = minHeight; MaxHeight = maxHeight;
+            Target = new Vector3(width * .5f, (minHeight + maxHeight) * .5f, depth * .5f);
             Distance = Mathf.Max(width, depth) * 1.35f;
             Yaw = -27f; Pitch = 55f; TopDown = topDown;
             ApplyView();
@@ -42,7 +44,7 @@ namespace FireEscape
             if (inside && !EnvironmentView.CameraInputBlocked)
             {
                 float scroll = Input.mouseScrollDelta.y;
-                Distance = Mathf.Clamp(Distance * Mathf.Exp(-scroll * .09f), 9f, 100f);
+                Distance = Mathf.Clamp(Distance * Mathf.Exp(-scroll * .09f), Extent * .02f, Extent * 3f);
                 if (Input.GetMouseButton(1))
                 {
                     if (TopDown) { TopDown = false; Pitch = 70f; }
@@ -55,8 +57,8 @@ namespace FireEscape
                     Vector3 forward = Vector3.Cross(right, Vector3.up).normalized;
                     Target -= right * mouseDelta.x * Distance * .0012f;
                     Target -= forward * mouseDelta.y * Distance * .0012f;
-                    Target.x = Mathf.Clamp(Target.x, -5f, MapWidth + 5f);
-                    Target.z = Mathf.Clamp(Target.z, -5f, MapDepth + 5f);
+                    Target.x = Mathf.Clamp(Target.x, -.1f * Extent, MapWidth + .1f * Extent);
+                    Target.z = Mathf.Clamp(Target.z, -.1f * Extent, MapDepth + .1f * Extent);
                 }
             }
             ApplyView();
@@ -65,14 +67,17 @@ namespace FireEscape
         private void ApplyView()
         {
             if (view == null) view = GetComponent<Camera>();
-            view.nearClipPlane = .15f; view.farClipPlane = 250f;
+            // Clip planes follow the map size; near plane grows with distance to keep depth precision for overlays.
+            float relief = Mathf.Max(0, MaxHeight - MinHeight);
+            view.nearClipPlane = Mathf.Max(.15f, Distance * .002f);
+            view.farClipPlane = Distance + 2f * (Extent + relief);
             view.orthographic = TopDown;
             if (TopDown)
             {
                 float aspect = Mathf.Max(.2f, view.aspect);
                 // Distance controls zoom in both perspective and orthographic mode.
                 view.orthographicSize = Mathf.Max(MapDepth * .55f, MapWidth / aspect * .55f) * Distance / (Mathf.Max(MapWidth, MapDepth) * 1.35f);
-                transform.position = Target + Vector3.up * 85f;
+                transform.position = new Vector3(Target.x, MaxHeight + Extent, Target.z);
                 transform.rotation = Quaternion.Euler(90f, 0, 0);
             }
             else

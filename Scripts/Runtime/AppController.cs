@@ -11,8 +11,8 @@ namespace FireEscape
     /// <summary>Owns live and Monte Carlo runs. Rendering never advances the mathematical model.</summary>
     public sealed class AppController : MonoBehaviour
     {
-        public ScenarioKind scenario = ScenarioKind.FireDetour;
         public ModelSettings parameters = new ModelSettings();
+        public TerrainSettings terrain = new TerrainSettings();
         GridMap map;
         Simulation simulation;
         EnvironmentView view;
@@ -21,9 +21,16 @@ namespace FireEscape
         bool running, batching, cancelBatch, heatVisible = true, hazardsVisible = true, ensembleVisible = true;
         bool finalMap, heatDirty = true, showHelp, recorded;
         int panelTab, editTool, completedTarget, replayRun;
-        string batchText = "200", seedText = "12345", message = "Spremno. Pokreni jednu evakuaciju ili Monte Carlo seriju.";
+        string batchText = "100", seedText = "12345", message = "Spremno. Odaberi ili generiraj mapu.";
         double accumulator;
-        float timeScale = 2, selectedTime = 15, visualClock;
+        float timeScale = 30, selectedTime = 300, visualClock;
+        // Map step: 0 = real map from Resources/FireEscape/Maps, 1 = random map from TerrainSettings.
+        int mapMode = 1, realIndex;
+        readonly List<TextAsset> realMaps = new List<TextAsset>();
+        string terrainSeedText = "";
+        TerrainSettings mapTerrain;              // settings of the current generated map; null for a real map
+        readonly HashSet<int> userBlocked = new HashSet<int>();
+        static readonly int[] MapSizes = { 65, 129, 257 };
         Vector2 panelScroll, helpScroll;
         GUIStyle titleStyle, subtitleStyle, bodyStyle, smallStyle, sectionStyle, panelStyle;
         Texture2D panelTexture, buttonTexture, legend;
@@ -45,13 +52,40 @@ namespace FireEscape
             view = GetComponent<EnvironmentView>();
             if (view == null) view = gameObject.AddComponent<EnvironmentView>();
             seedText = parameters.Seed.ToString(CultureInfo.InvariantCulture);
-            LoadPreset(scenario);
+            realMaps.AddRange(Resources.LoadAll<TextAsset>("FireEscape/Maps"));
+            realMaps.Sort((a, b) => string.CompareOrdinal(a.name, b.name));
+            BuildMap();
+            panelTab = 0;
         }
-        void LoadPreset(ScenarioKind value)
+        /// <summary>Step 1: build the map (real or random), then place default start, fire and exits.</summary>
+        void BuildMap()
         {
-            scenario = value; map = ScenarioFactory.Create(value);
-            view.Build(map); ResetRun(true); view.ResetCamera(false);
-            message = ScenarioFactory.Name(value) + " — promijeni parametre ili pokreni simulaciju.";
+            try
+            {
+                GridMap next; TerrainSettings used = null; int seed;
+                if (mapMode == 0)
+                {
+                    if (realMaps.Count == 0) throw new InvalidOperationException("Nema stvarnih mapa u Resources/FireEscape/Maps (pokreni python izvoz_unity.py).");
+                    realIndex = Mathf.Clamp(realIndex, 0, realMaps.Count - 1);
+                    TextAsset asset = realMaps[realIndex];
+                    next = MapFile.Read(asset.bytes, asset.name, terrain.MaxSlopeDeg);
+                    seed = parameters.Seed;
+                }
+                else
+                {
+                    used = terrain.Clone();
+                    int fixedSeed;
+                    used.Seed = int.TryParse(terrainSeedText, out fixedSeed) && fixedSeed >= 0 ? fixedSeed : -1;
+                    next = TerrainGenerator.Generate(used, out seed);
+                    used.Seed = seed;
+                }
+                ScenarioSetup.PlaceDefaults(next, seed);
+                map = next; mapTerrain = used; userBlocked.Clear(); editTool = 0;
+                view.Build(map); ResetRun(true); view.ResetCamera(false);
+                message = "Mapa " + map.Name + " (" + map.Width + " × " + map.Depth + ", ćelija " + map.CellSize.ToString("0.#", CultureInfo.InvariantCulture)
+                    + " m). Zadani početak, požar i izlazi su postavljeni; uredi ih u koraku 2.";
+            }
+            catch (Exception e) { message = "Mapa nije napravljena: " + e.Message; Debug.LogException(e); }
         }
         void ResetRun(bool clearResults)
         {
@@ -67,8 +101,9 @@ namespace FireEscape
         void Update()
         {
             Vector2 mp = new Vector2(Input.mousePosition.x, Screen.height - Input.mousePosition.y) / UiScale;
-            EnvironmentView.CameraInputBlocked = showHelp || mp.x < 370 || mp.y < 72 || mp.y > UiHeight - 156 || (mp.x < 670 && mp.y < 245);
+            EnvironmentView.CameraInputBlocked = showHelp || map == null || mp.x < 370 || mp.y < 72 || mp.y > UiHeight - 156 || (mp.x < 670 && mp.y < 245);
             if (Input.GetKeyDown(KeyCode.Escape)) { editTool = 0; showHelp = false; }
+            if (map == null || simulation == null) return;   // map step failed; the panel shows why
             if (!showHelp && !batching && Input.GetKeyDown(KeyCode.Space)) ToggleRun();
             if (!showHelp && Input.GetKeyDown(KeyCode.T)) view.ResetCamera(true);
             if (!showHelp && Input.GetKeyDown(KeyCode.V)) view.ResetCamera(false);
@@ -153,7 +188,7 @@ namespace FireEscape
             Camera camera = Camera.main; if (camera == null) return;
             Ray ray = camera.ScreenPointToRay(Input.mousePosition);
             // Select the terrain collider even if decorations or a wall also intersect the ray.
-            RaycastHit[] hits = Physics.RaycastAll(ray, 1000);
+            RaycastHit[] hits = Physics.RaycastAll(ray, float.PositiveInfinity);
             Array.Sort(hits, (a,b) => a.distance.CompareTo(b.distance));
             int index = -1;
             foreach (RaycastHit hit in hits)
@@ -171,9 +206,14 @@ namespace FireEscape
                 else if (map.FireSources.Count < 100) map.FireSources.Add(p);
                 else { message="Najviše 100 izvora požara po scenariju."; return; }
             }
-            else if (editTool == 3 && index != map.CellIndex(map.Start) && !c.Exit && !map.FireSources.Exists(f => map.CellIndex(f) == index)) c.Blocked = !c.Blocked;
+            else if (editTool == 3 && index != map.CellIndex(map.Start) && !c.Exit && !map.FireSources.Exists(f => map.CellIndex(f) == index))
+            {
+                // Only obstacles placed by the user can be removed; water and cliffs stay blocked.
+                if (userBlocked.Contains(index)) { userBlocked.Remove(index); c.Blocked = false; }
+                else if (!c.Blocked) { userBlocked.Add(index); c.Blocked = true; }
+                else return;
+            }
             else if (editTool == 4 && !c.Blocked) c.Exit = !c.Exit;
-            else if (editTool >= 5 && !c.Blocked) c.Terrain = (TerrainKind)(editTool - 5);
             else return;
             view.Build(map); ResetRun(true); message = "Scenarij izmijenjen. Prethodni rezultati očišćeni.";
         }
@@ -208,32 +248,32 @@ namespace FireEscape
             GUI.skin.button.fontSize=12; GUI.skin.button.normal.background=buttonTexture;
             GUI.skin.button.normal.textColor=Color.white; GUI.skin.label.wordWrap=true;
             GUI.Label(new Rect(18,12,650,34),"FIRE / ESCAPE LAB",titleStyle);
-            GUI.Label(new Rect(20,47,UiWidth-40,22),"3D SIMULACIJA  /  JEDNA OSOBA  /  TEREN + OPASNOST + NESIGURNOST",subtitleStyle);
+            GUI.Label(new Rect(20,47,UiWidth-40,22),"3D SIMULACIJA  /  JEDNA OSOBA  /  "+(map==null?"":map.Name.ToUpperInvariant()+"  /  ")+"TEREN + POŽAR + NESIGURNOST",subtitleStyle);
             GUILayout.BeginArea(new Rect(16,82,342,UiHeight-98),panelStyle);
-            panelTab=GUILayout.Toolbar(panelTab,new[]{"Simulacija","Parametri","Prostor"},GUILayout.Height(30));
+            int tab=GUILayout.Toolbar(panelTab,new[]{"1 · Mapa","2 · Požar i osoba","3 · Simulacija"},GUILayout.Height(30));
+            if(tab!=panelTab){panelTab=tab;editTool=0;}
             panelScroll=GUILayout.BeginScrollView(panelScroll);
-            if(panelTab==0) DrawSimulationPanel();
-            else if(panelTab==1) DrawParameterPanel();
-            else DrawEditorPanel();
+            if(panelTab==0) DrawMapPanel();
+            else if(panelTab==1) { DrawEditorPanel(); DrawParameterPanel(); }
+            else DrawSimulationPanel();
             GUILayout.Space(10); GUILayout.Label(message,smallStyle);
             GUILayout.EndScrollView();
             if(Button("Upute i značenje toplinske karte")) showHelp=true;
             GUILayout.EndArea();
-            DrawMetrics(); DrawTimeline();
+            if(simulation!=null) { DrawMetrics(); DrawTimeline(); }
             if(showHelp) DrawHelp();
         }
         void DrawSimulationPanel()
         {
-            Section("01  SCENARIJ"); GUI.enabled=!batching && !running;
-            int next=GUILayout.SelectionGrid((int)scenario,new[]{"Osnovni","Požar / obilazak","Teren / nagib","Blokirani izlaz"},2,GUILayout.Height(62));
-            if(next!=(int)scenario) LoadPreset((ScenarioKind)next);
+            Section("01  JEDNO IZVOĐENJE");
             GUI.enabled=!batching;
             GUILayout.BeginHorizontal(); if(Button(running?"Pauziraj  [Space]":"Pokreni  [Space]")) ToggleRun();
             if(Button("Reset")) { ResetRun(true); message="Početno stanje vraćeno; parametri i prostor sačuvani."; } GUILayout.EndHorizontal();
-            Label("Brzina prikaza: "+timeScale.ToString("0.0")+"×"); timeScale=GUILayout.HorizontalSlider(timeScale,.25f,12);
+            Label("Brzina prikaza: "+timeScale.ToString("0")+"×"); timeScale=GUILayout.HorizontalSlider(timeScale,1,300);
             GUI.enabled=true;
             Section("02  MONTE CARLO"); GUI.enabled=!batching && !running;
             Label("Broj ponavljanja (1–2000)"); batchText=GUILayout.TextField(batchText,5);
+            GUILayout.Label("Na velikoj mapi jedno izvođenje traje do nekoliko sekundi; za prvu procjenu dovoljno je 50–100.",smallStyle);
             Label("Početni seed"); string changedSeed=GUILayout.TextField(seedText,10);
             if(changedSeed!=seedText) { seedText=changedSeed; int seed; if(int.TryParse(seedText,out seed) && seed>=0 && seed<int.MaxValue-2000) { parameters.Seed=seed; ResetRun(true); } }
             if(Button("Pokreni seriju ponavljanja"))
@@ -261,20 +301,23 @@ namespace FireEscape
         {
             GUI.enabled=!batching && !running;
             bool before=GUI.changed; GUI.changed=false;
-            Section("KRETANJE");
+            Section("OSOBA: KRETANJE");
             parameters.BaseSpeed=Slider("Slobodna brzina",parameters.BaseSpeed,.5f,2.2f," m/s");
             parameters.SpeedSigma=Slider("Standardna devijacija brzine",parameters.SpeedSigma,0,.4f," m/s");
-            parameters.ReactionDelay=Slider("Osnovno kašnjenje reakcije",parameters.ReactionDelay,0,15," s");
-            parameters.ReactionJitter=Slider("Odstupanje reakcije (±)",parameters.ReactionJitter,0,10," s");
-            Section("ODLUČIVANJE");
+            parameters.ReactionDelay=Slider("Osnovno kašnjenje reakcije",parameters.ReactionDelay,0,300," s");
+            parameters.ReactionJitter=Slider("Odstupanje reakcije (±)",parameters.ReactionJitter,0,120," s");
+            Section("OSOBA: ODLUČIVANJE");
             parameters.Stress=Slider("Stres (heuristika)",parameters.Stress,0,1);
             parameters.Familiarity=Slider("Poznavanje prostora",parameters.Familiarity,0,1);
             parameters.RiskAversion=Slider("Izbjegavanje opasnosti",parameters.RiskAversion,0,10);
             parameters.DecisionNoise=Slider("Nesigurnost izbora puta",parameters.DecisionNoise,0,1);
-            Section("OPASNOST I VRIJEME");
+            Section("POŽAR, DIM I VRIJEME");
+            parameters.FireStartRadius=Slider("Početni polumjer požara",parameters.FireStartRadius,5,300," m");
+            parameters.FireGrowth=Slider("Širenje požara",parameters.FireGrowth,0,1," m/s");
             parameters.SmokeStrength=Slider("Intenzitet dima",parameters.SmokeStrength,0,3);
-            parameters.FireGrowth=Slider("Širenje požara",parameters.FireGrowth,0,.08f," m/s");
-            parameters.Horizon=Math.Round(Slider("Trajanje scenarija",parameters.Horizon,30,240," s"));
+            parameters.SmokeRadius=Slider("Početni polumjer dima",parameters.SmokeRadius,20,1000," m");
+            parameters.SmokeGrowth=Slider("Širenje dima",parameters.SmokeGrowth,0,3," m/s");
+            parameters.Horizon=Math.Round(Slider("Trajanje scenarija",parameters.Horizon,300,7200," s"));
             GUILayout.Label("Korak modela: "+parameters.TimeStep.ToString("0.00")+" s; interval snimki: "+parameters.SnapshotInterval.ToString("0.0")+" s. Zapis uključuje i međukorake. Napredni parametri dostupni su u JSON-u i Inspectoru.",smallStyle);
             bool changed=GUI.changed; GUI.changed=before||changed;
             if(changed) { selectedTime=Mathf.Min(selectedTime,(float)parameters.Horizon); ResetRun(true); message="Parametri promijenjeni; prethodni rezultati očišćeni."; }
@@ -283,19 +326,83 @@ namespace FireEscape
         }
         void DrawEditorPanel()
         {
-            Section("UREĐIVANJE PROSTORA");
-            Label("Odaberi alat pa lijevim klikom označi pod u 3D prikazu. Uređivanje briše rezultate.");
+            Section("POČETAK, POŽAR I IZLAZI");
+            Label("Odaberi alat pa lijevim klikom označi teren u 3D prikazu. Svaka izmjena briše rezultate.");
             GUI.enabled=!batching && !running;
-            editTool=GUILayout.SelectionGrid(editTool,new[]{"Bez alata","Početak osobe","Požar ±","Prepreka ±","Izlaz ±","Pod","Trava","Šuta"},2,GUILayout.Height(140));
-            GUILayout.Label("Požar, prepreka i izlaz uključuju se / uklanjaju ponovnim klikom. Početak ne može biti unutar prepreke.",smallStyle);
-            Section("SCENARIJ NA DISKU");
-            if(Button("Spremi scenario.json")) TrySaveScenario();
-            if(Button("Učitaj scenario.json")) TryLoadScenario();
-            if(Button("Vrati odabrani predložak")) LoadPreset(scenario);
+            editTool=GUILayout.SelectionGrid(editTool,new[]{"Bez alata","Početak osobe","Požar ±","Prepreka ±","Izlaz ±"},2,GUILayout.Height(92));
+            GUILayout.Label("Požar, prepreka i izlaz uključuju se / uklanjaju ponovnim klikom. Voda i stijene (zatamnjeno) su neprohodne. Izlazi su zelene ćelije.",smallStyle);
+            GUILayout.BeginHorizontal();
+            if(Button("Svi rubovi = izlaz")) EditMap(()=>ScenarioSetup.SetAllEdgeExits(map),"Svi prohodni rubovi mape su izlazi.");
+            if(Button("Ukloni izlaze")) EditMap(()=>ScenarioSetup.ClearExits(map),"Izlazi uklonjeni; dodaj nove alatom Izlaz ±.");
+            GUILayout.EndHorizontal();
+            GUILayout.BeginHorizontal();
+            if(Button("Ukloni požare")) EditMap(()=>map.FireSources.Clear(),"Požari uklonjeni.");
+            if(Button("Zadani raspored")) EditMap(()=>{foreach(int i in userBlocked)map.Cells[i].Blocked=false;userBlocked.Clear();ScenarioSetup.PlaceDefaults(map,parameters.Seed);},"Vraćen zadani početak, požar i izlazi.");
+            GUILayout.EndHorizontal();
+            if(Button("Dalje: simulacija  →")) { editTool=0; panelTab=2; }
             GUI.enabled=true;
-            GUILayout.Label("Lokacija: "+Application.persistentDataPath,smallStyle);
             Section("KAMERA"); Label("Desna tipka: rotacija\nSrednja tipka: pomicanje\nKotačić: približavanje\nT: tlocrt · V: 3D · Esc: kraj uređivanja");
         }
+        void EditMap(Action change,string done)
+        {
+            change(); view.Build(map); ResetRun(true); message=done+" Prethodni rezultati očišćeni.";
+        }
+        void DrawMapPanel()
+        {
+            GUI.enabled=!batching && !running;
+            Section("IZVOR MAPE");
+            mapMode=GUILayout.Toolbar(mapMode,new[]{"Stvarna mapa","Nasumična mapa"},GUILayout.Height(28));
+            if(mapMode==0)
+            {
+                if(realMaps.Count==0) Label("Nema izvezenih mapa. U python/ pokreni: uv run python izvoz_unity.py");
+                else
+                {
+                    var names=new string[realMaps.Count]; for(int i=0;i<names.Length;i++) names[i]=realMaps[i].name;
+                    realIndex=GUILayout.SelectionGrid(Mathf.Clamp(realIndex,0,names.Length-1),names,2,GUILayout.Height(30*((names.Length+1)/2)));
+                    GUILayout.Label("Copernicus DEM GLO-30 i ESA WorldCover 2021, izvezeno iz python/mape/.",smallStyle);
+                }
+            }
+            else
+            {
+                Section("TEREN");
+                int sizeIndex=Mathf.Max(0,Array.IndexOf(MapSizes,terrain.Size));
+                Label("Veličina mreže (čvorova po strani)");
+                sizeIndex=GUILayout.Toolbar(sizeIndex,new[]{"65","129","257"}); terrain.Size=MapSizes[sizeIndex];
+                terrain.CellSize=Math.Round(Slider("Veličina ćelije",terrain.CellSize,2,30," m"));
+                GUILayout.Label("Mapa je "+((terrain.Size-1)*terrain.CellSize/1000).ToString("0.00",CultureInfo.InvariantCulture)+" km × "+((terrain.Size-1)*terrain.CellSize/1000).ToString("0.00",CultureInfo.InvariantCulture)+" km.",smallStyle);
+                terrain.ReliefM=Math.Round(Slider("Visina grebena",terrain.ReliefM,0,1000," m"));
+                terrain.RidgeShare=Share("Grebeni i brda (brijegovi)",terrain.RidgeShare);
+                terrain.ValleyShare=Share("Doline (udoline)",terrain.ValleyShare);
+                Section("VODA");
+                terrain.WaterShare=Math.Min(.9,Share("Voda",terrain.WaterShare));
+                terrain.Water=(WaterMode)GUILayout.Toolbar((int)terrain.Water,new[]{"More uz rub","Jezera"});
+                Section("POKROV KOPNA");
+                terrain.ForestShare=Share("Šuma",terrain.ForestShare);
+                terrain.ShrubShare=Share("Makija",terrain.ShrubShare);
+                terrain.BareShare=Share("Golo / kamenjar",terrain.BareShare);
+                double rest=1-terrain.ForestShare-terrain.ShrubShare-terrain.BareShare;
+                GUILayout.Label(rest>=-1e-9?"Travnjak (ostatak): "+(100*Math.Max(0,rest)).ToString("0")+" %":"Šuma + makija + golo prelaze 100 %: smanji neki udio.",smallStyle);
+                Section("SEED");
+                Label("Prazno = nova nasumična mapa svaki put; broj = ista mapa.");
+                terrainSeedText=GUILayout.TextField(terrainSeedText,7);
+            }
+            Section("PROHODNOST");
+            terrain.MaxSlopeDeg=Math.Round(Slider("Najveći prohodni nagib",terrain.MaxSlopeDeg,20,70,"°"));
+            GUILayout.Space(8);
+            bool valid=mapMode==0?realMaps.Count>0:terrain.ForestShare+terrain.ShrubShare+terrain.BareShare<=1+1e-9;
+            GUI.enabled=!batching && !running && valid;
+            if(Button(mapMode==0?"Učitaj mapu":"Generiraj mapu")) BuildMap();
+            GUI.enabled=!batching && !running && map!=null;
+            if(Button("Dalje: požar i osoba  →")) panelTab=1;
+            GUI.enabled=true;
+            if(map!=null && mapTerrain!=null)
+            {
+                var m=TerrainGenerator.Measure(map);
+                GUILayout.Label("Izmjereno: voda "+Pct(m["water"])+", šuma "+Pct(m["forest"])+", makija "+Pct(m["shrub"])+", travnjak "+Pct(m["grass"])+", golo "+Pct(m["bare"])+" (pokrov od kopna), neprohodno kopno "+Pct(m["blockedLand"])+".",smallStyle);
+            }
+        }
+        double Share(string label,double value){ return Math.Round(Slider(label+" (udio)",value,0,1),2); }
+        static string Pct(double x){ return (100*x).ToString("0",CultureInfo.InvariantCulture)+" %"; }
         void DrawMetrics()
         {
             GUILayout.BeginArea(new Rect(378,82,290,155),panelStyle);
@@ -341,36 +448,25 @@ namespace FireEscape
             GUI.Box(new Rect(0,0,UiWidth,UiHeight),GUIContent.none,panelStyle);
             GUILayout.BeginArea(new Rect(Mathf.Max(30,(UiWidth-800)/2),35,Mathf.Min(800,UiWidth-60),UiHeight-70),panelStyle);
             GUILayout.Label("KAKO KORISTITI PROJEKT",titleStyle); helpScroll=GUILayout.BeginScrollView(helpScroll);
-            Label("1. Odaberi scenarij i klikni Pokreni. Jedna osoba odabire put do izlaza uz trošak terena, nagiba, dima i topline. Pauziraj ili ubrzaj prikaz bez promjene vremenskog koraka modela.");
+            Label("1. Mapa: učitaj stvarnu mapu (izvezenu iz python/mape/) ili generiraj nasumičnu iz postavki (udio grebena, dolina, vode i pokrova). Nasumična mapa se ne sprema; njezin seed je u imenu, pa se može ponoviti.");
+            Label("2. Požar i osoba: zadani početak, požar i izlazi postavljaju se sami; promijeni ih alatima i namjesti parametre osobe i požara.");
+            Label("3. Simulacija: klikni Pokreni. Jedna osoba odabire put do izlaza uz trošak pokrova tla, nagiba, dima i topline. Pauziraj ili ubrzaj prikaz bez promjene vremenskog koraka modela.");
             Section("PONAVLJANJA I TOPLINSKA KARTA");
             Label("2. Pokreni npr. 200 ponavljanja. Isti početni seed i parametri reproduciraju iste rezultate. Svako izvođenje uzorkuje vlastitu brzinu, reakciju i odluke.");
             Label("3. Pomakni vremenski klizač. Svaka boja predstavlja p(X(t) u ćeliji): broj ponavljanja u kojima je osoba ondje / broj završenih ponavljanja. Zbroj je 1. Ovo nije broj posjeta ćeliji niti karta temperature. Nula je prozirna; skala boja uvijek je 0–100 %.");
             Label("Nakon evakuacije ili drugog završetka osoba ostaje na završnoj lokaciji za potrebe statistike. Zato zelena područja izlaza mogu imati visoku vjerojatnost. Prekidač Konačni položaji koristi završetak svakog izvođenja, a ne zajedničko vrijeme.");
             Label("Prikazana osoba i plava putanja u pregledu rezultata pripadaju prvom izvođenju. Ostale tanke putanje prikazuju najviše 80 ponavljanja; toplinska karta uvijek koristi sva završena izvođenja.");
             Section("UREĐIVANJE I IZVOZ");
-            Label("Prostor → alat → lijevi klik na pod. Moguće je mijenjati početak, požare, prepreke, izlaze i materijal terena. Parametri upravljaju brzinom, reakcijom, stresom, poznavanjem prostora, dimom i širenjem požara. Promjena briše stare rezultate.");
-            Label("Izvoz stvara trajectories.csv, runs.csv, heatmap.csv, heatmap.png, heatmap_legend.png i metadata.json u mapi Exports unutar persistentDataPath. Scenarij se sprema odvojeno kao scenario.json. PNG ima sjever (+Z) gore; CSV sadrži točne koordinate i vjerojatnosti.");
+            Label("Korak 2 → alat → lijevi klik na teren. Moguće je mijenjati početak, požare, prepreke i izlaze. Parametri upravljaju brzinom, reakcijom, stresom, poznavanjem prostora, dimom i širenjem požara. Promjena briše stare rezultate.");
+            Label("Izvoz stvara trajectories.csv, runs.csv, heatmap.csv, heatmap.png, heatmap_legend.png i metadata.json u mapi Exports unutar persistentDataPath. metadata.json sadrži ime mape (i postavke generatora sa seedom), početak, požare, izlaze i prepreke. PNG ima sjever (+Z) gore; CSV sadrži točne koordinate i vjerojatnosti.");
             Section("ŠTO MODEL PREDSTAVLJA");
-            Label("Ovo je istraživački demonstrator, bez empirijske kalibracije. Požar i dim su sintetička polja, ne CFD; dim ne poštuje ventilaciju ni nepropusnost zidova. Pokazatelj izloženosti nije fiziološki FED. Nema drugih osoba, sudara u gomili ni socijalnog ponašanja. Kretanje je po mreži na 3D terenu (2,5D), bez katova koji se preklapaju. Detaljne jednadžbe i izvori nalaze se u Documentation.");
+            Label("Ovo je istraživački demonstrator, bez empirijske kalibracije. Požar i dim su sintetička polja (krug koji raste zadanom brzinom), ne model širenja požara: ne ovise o vjetru, nagibu ni gorivu. Pokazatelj izloženosti nije fiziološki FED. Nema drugih osoba, sudara u gomili ni socijalnog ponašanja. Kretanje je po mreži na 3D terenu (2,5D); brzina ovisi o nagibu i pokrovu tla, a voda i stijene su neprohodne. Detaljne jednadžbe i izvori nalaze se u Documentation.");
             GUILayout.EndScrollView(); if(Button("Zatvori  [Esc]"))showHelp=false; GUILayout.EndArea();
         }
         void TryExport()
         {
-            try { message="Izvezeno: "+ResultsExporter.Export(map,parameters,runs,selectedTime,finalMap,scenario); }
+            try { message="Izvezeno: "+ResultsExporter.Export(map,parameters,runs,selectedTime,finalMap,mapTerrain,new List<int>(userBlocked)); }
             catch(Exception e) { message="Izvoz nije uspio: "+e.Message; Debug.LogException(e); }
-        }
-        void TrySaveScenario()
-        {
-            try { ScenarioStorage.Save(Path.Combine(Application.persistentDataPath,"scenario.json"),map,parameters,scenario);message="Scenarij spremljen u "+Application.persistentDataPath; }
-            catch(Exception e){message="Spremanje nije uspjelo: "+e.Message;}
-        }
-        void TryLoadScenario()
-        {
-            try { GridMap loaded; ModelSettings settings; ScenarioKind kind;
-                ScenarioStorage.Load(Path.Combine(Application.persistentDataPath,"scenario.json"),out loaded,out settings,out kind);
-                map=loaded;parameters=settings;scenario=kind;seedText=parameters.Seed.ToString();selectedTime=Mathf.Min(selectedTime,(float)parameters.Horizon);
-                view.Build(map);ResetRun(true);view.ResetCamera(false);message="Scenarij učitan.";
-            } catch(Exception e){message="Učitavanje nije uspjelo: "+e.Message;}
         }
         static string StatusName(RunStatus status)
         {

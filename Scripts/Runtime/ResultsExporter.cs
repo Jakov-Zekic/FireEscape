@@ -13,15 +13,20 @@ namespace FireEscape
         static string N(double value) { return value.ToString("R",CultureInfo.InvariantCulture); }
         [Serializable] sealed class ExportMetadata
         {
-            public string schemaVersion="1.0", createdUtc, scenario, mapConvention="index=z*width+x; world units=metres; PNG top=+Z", heatmapMode;
+            public string schemaVersion="2.0", createdUtc, mapName, mapSource, mapConvention="index=z*width+x; world units=metres; PNG top=+Z", heatmapMode;
             public double selectedTimeSeconds, cellSizeMetres, successFraction, meanSuccessfulEvacuationSeconds;
             public double[] successWilson95;
             public int runCount, width, depth;
             public ModelSettings parameters;
+            public TerrainSettings terrainSettings; // only for generated maps; with the seed in mapName it rebuilds the map
+            public Point start;
+            public Point[] fireSources;
+            public int[] exitCells, userBlockedCells;
             public string interpretation="p(cell)=count/N; terminal positions absorbing; all complete runs including failures; fixed colour scale 0..1";
             public string limitations="Synthetic hazard; no CFD or physiological FED; uncalibrated single-person 2.5D research demonstration.";
         }
-        public static string Export(GridMap map,ModelSettings settings,IList<RunResult> runs,double time,bool final,ScenarioKind scenario)
+        /// <summary>terrain is null for real maps; userBlocked are cells the user turned into obstacles.</summary>
+        public static string Export(GridMap map,ModelSettings settings,IList<RunResult> runs,double time,bool final,TerrainSettings terrain,IList<int> userBlocked)
         {
             if(runs.Count==0) throw new InvalidOperationException("Nema dovršenih izvođenja.");
             string folder=Path.Combine(Application.persistentDataPath,"Exports",DateTime.UtcNow.ToString("yyyyMMdd_HHmmss_fff",CultureInfo.InvariantCulture));
@@ -58,9 +63,13 @@ namespace FireEscape
             for(int x=0;x<512;x++)for(int y=0;y<32;y++){Color c=EnvironmentView.ProbabilityColor(x/511f);c.a=1;legend.SetPixel(x,y,c);}
             legend.Apply();File.WriteAllBytes(Path.Combine(folder,"heatmap_legend.png"),legend.EncodeToPNG());UnityEngine.Object.Destroy(legend);
             double mean=Statistics.MeanEvacuationTime(runs);
-            var metadata=new ExportMetadata{createdUtc=DateTime.UtcNow.ToString("o"),scenario=ScenarioFactory.Name(scenario),heatmapMode=final?"final_positions":"position_at_time",selectedTimeSeconds=time,cellSizeMetres=map.CellSize,runCount=runs.Count,width=map.Width,depth=map.Depth,parameters=settings.Clone(),successFraction=(double)successes/runs.Count,meanSuccessfulEvacuationSeconds=double.IsNaN(mean)?-1:mean,successWilson95=Statistics.WilsonInterval(successes,runs.Count)};
+            var exits=new List<int>(); for(int i=0;i<map.Cells.Length;i++) if(map.Cells[i].Exit) exits.Add(i);
+            var metadata=new ExportMetadata{createdUtc=DateTime.UtcNow.ToString("o"),mapName=map.Name,mapSource=terrain==null?"real (python/izvoz_unity.py)":"generated (TerrainGenerator)",
+                heatmapMode=final?"final_positions":"position_at_time",selectedTimeSeconds=time,cellSizeMetres=map.CellSize,runCount=runs.Count,width=map.Width,depth=map.Depth,
+                parameters=settings.Clone(),terrainSettings=terrain==null?null:terrain.Clone(),start=map.Start,fireSources=map.FireSources.ToArray(),exitCells=exits.ToArray(),
+                userBlockedCells=new List<int>(userBlocked).ToArray(),
+                successFraction=(double)successes/runs.Count,meanSuccessfulEvacuationSeconds=double.IsNaN(mean)?-1:mean,successWilson95=Statistics.WilsonInterval(successes,runs.Count)};
             File.WriteAllText(Path.Combine(folder,"metadata.json"),JsonUtility.ToJson(metadata,true),Encoding.UTF8);
-            ScenarioStorage.Save(Path.Combine(folder,"scenario.json"),map,settings,scenario);
             File.WriteAllText(Path.Combine(folder,"README.txt"),"FIRE / ESCAPE LAB\n"+
                 "N="+runs.Count+"; mode="+(final?"FINAL POSITIONS (per-run end time)":"POSITION AT t="+N(time)+" s")+"\n"+
                 "heatmap.png: top is +Z; cell size "+N(map.CellSize)+" m. The map includes its selected time or terminal mode, N and fixed colour legend.\n"+
@@ -70,50 +79,8 @@ namespace FireEscape
                 "Wilson intervals are marginal per cell, not simultaneous confidence bands.\n"+
                 "meanSuccessfulEvacuationSeconds=-1 denotes no successful runs.\n"+
                 "trajectories.csv contains integration/waypoint records in addition to fixed snapshot times.\n"+
-                "scenario.json reproduces the full edited map; seeds in runs.csv identify every run.\n",Encoding.UTF8);
+                "metadata.json names the map (real map, or generator settings + seed in mapName), start, fires, exits and obstacles; seeds in runs.csv identify every run.\n",Encoding.UTF8);
             return folder;
-        }
-    }
-
-    public static class ScenarioStorage
-    {
-        [Serializable] sealed class ScenarioData
-        {
-            public int schemaVersion=1,width,depth;
-            public double cellSize;
-            public ScenarioKind kind;
-            public Cell[] cells;
-            public Point start;
-            public Point[] fireSources;
-            public ModelSettings parameters;
-        }
-        public static void Save(string path,GridMap map,ModelSettings settings,ScenarioKind kind)
-        {
-            var data=new ScenarioData{width=map.Width,depth=map.Depth,cellSize=map.CellSize,kind=kind,cells=map.Cells,start=map.Start,fireSources=map.FireSources.ToArray(),parameters=settings.Clone()};
-            string directory=Path.GetDirectoryName(path);if(!string.IsNullOrEmpty(directory))Directory.CreateDirectory(directory);
-            File.WriteAllText(path,JsonUtility.ToJson(data,true),Encoding.UTF8);
-        }
-        static bool Finite(double v){return !double.IsNaN(v)&&!double.IsInfinity(v);}
-        public static void Load(string path,out GridMap map,out ModelSettings settings,out ScenarioKind kind)
-        {
-            ScenarioData data=JsonUtility.FromJson<ScenarioData>(File.ReadAllText(path));
-            if(data==null||data.schemaVersion!=1||data.width<3||data.width>120||data.depth<3||data.depth>120||!Finite(data.cellSize)||data.cellSize<.5||data.cellSize>5||data.cells==null||data.cells.Length!=data.width*data.depth||data.parameters==null||!Enum.IsDefined(typeof(ScenarioKind),data.kind))
-                throw new InvalidDataException("Neispravan format / veličina scenarija.");
-            var candidate=new GridMap(data.width,data.depth,data.cellSize);
-            for(int i=0;i<data.cells.Length;i++)
-            {
-                Cell c=data.cells[i];
-                if(c==null||!Finite(c.Height)||Math.Abs(c.Height)>100||!Enum.IsDefined(typeof(TerrainKind),c.Terrain)||c.Blocked&&c.Exit)throw new InvalidDataException("Neispravna ćelija "+i);
-                candidate.Cells[i]=c;
-            }
-            candidate.Start=data.start;
-            if(!Finite(data.start.X)||!Finite(data.start.Z)||!candidate.IsWalkable(data.start))throw new InvalidDataException("Početak osobe nije na prolaznom terenu.");
-            candidate.Start=candidate.Center(candidate.CellIndex(candidate.Start));
-            if(data.fireSources==null||data.fireSources.Length>100)throw new InvalidDataException("Neispravni izvori požara.");
-            foreach(Point fire in data.fireSources){if(!Finite(fire.X)||!Finite(fire.Z)||!candidate.IsWalkable(fire))throw new InvalidDataException("Požar nije na prolaznom terenu.");candidate.FireSources.Add(fire);}
-            // Construction validates all model parameters before replacing the currently open scenario.
-            new Simulation(candidate,data.parameters,data.parameters.Seed);
-            map=candidate;settings=data.parameters;kind=data.kind;
         }
     }
 }

@@ -18,7 +18,7 @@ namespace FireEscape
         {
             if (map == null || probabilities == null || probabilities.Length != map.Cells.Length)
                 throw new ArgumentException("A map and matching probability array are required.");
-            int cell = Mathf.Clamp(720 / Math.Max(map.Width, map.Depth), 6, 18);
+            int cell = Mathf.Clamp(720 / Math.Max(map.Width, map.Depth), 2, 18);
             int margin = 20, header = 76, footer = 103;
             int mapWidth = map.Width * cell, mapHeight = map.Depth * cell;
             int width = Math.Max(440, mapWidth + margin * 2), height = header + mapHeight + footer;
@@ -36,7 +36,7 @@ namespace FireEscape
                 {
                     int index = z * map.Width + x;
                     Cell modelCell = map.Cells[index];
-                    Color32 colour = modelCell.Blocked ? new Color32(33, 43, 51, 255) : new Color32(65, 78, 86, 255);
+                    Color32 colour = modelCell.Terrain == TerrainKind.Water ? new Color32(28, 52, 80, 255) : modelCell.Blocked ? new Color32(33, 43, 51, 255) : new Color32(65, 78, 86, 255);
                     if (probabilities[index] > 0)
                     {
                         Color p = EnvironmentView.ProbabilityColor((float)probabilities[index]); p.a = 1;
@@ -44,10 +44,15 @@ namespace FireEscape
                     }
                     int px = mapX + x * cell, py = header + (map.Depth - 1 - z) * cell;
                     Rect(pixels, width, height, px, py, cell, cell, colour);
-                    // Cell boundaries preserve the estimator's actual spatial resolution.
-                    Rect(pixels, width, height, px, py, cell, 1, new Color32(23, 33, 43, 255));
-                    Rect(pixels, width, height, px, py, 1, cell, new Color32(23, 33, 43, 255));
-                    if (modelCell.Exit && !modelCell.Blocked)
+                    // Cell boundaries preserve the estimator's actual spatial resolution (only when cells are big enough to see).
+                    if (cell >= 6)
+                    {
+                        Rect(pixels, width, height, px, py, cell, 1, new Color32(23, 33, 43, 255));
+                        Rect(pixels, width, height, px, py, 1, cell, new Color32(23, 33, 43, 255));
+                    }
+                    if (modelCell.Exit && !modelCell.Blocked && cell < 6)
+                        Rect(pixels, width, height, px, py, cell, cell, new Color32(99, 246, 163, 255));
+                    else if (modelCell.Exit && !modelCell.Blocked)
                     {
                         Color32 green = new Color32(99, 246, 163, 255);
                         Rect(pixels, width, height, px + 1, py + 1, cell - 2, 1, green);

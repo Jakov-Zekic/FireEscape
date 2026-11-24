@@ -14,8 +14,11 @@ namespace FireEscape
     {
         public static bool CameraInputBlocked;
         public Camera SceneCamera { get { return sceneCamera; } }
-        private const int VerticesPerCell = 9;
+        private const int VerticesPerCell = 4;
         private GridMap map;
+        // Size of markers (person, fire, lines) relative to human scale; grows with the map so they stay visible.
+        private float unit = 1;
+        private float minHeight, maxHeight;
         private Transform world;
         private Transform person, leftLeg, rightLeg, leftArm, rightArm;
         private Transform fireRoot, ensembleRoot;
@@ -36,7 +39,7 @@ namespace FireEscape
         private Vector3 previousPosition;
         private bool havePreviousPosition;
         private float facingYaw;
-        private double lastSmokeStrength = double.NaN, lastFireGrowth = double.NaN;
+        private ModelSettings lastHazardSettings;
         private double lastHazardTime = -100;
         private bool hazardsVisible = true;
 
@@ -45,11 +48,14 @@ namespace FireEscape
             if (newMap == null) throw new ArgumentNullException("newMap");
             ClearWorld();
             map = newMap;
+            float extent = (float)(Math.Max(map.Width, map.Depth) * map.CellSize);
+            unit = Mathf.Max(1f, extent / 150f);
+            minHeight = float.PositiveInfinity; maxHeight = float.NegativeInfinity;
+            foreach (Cell c in map.Cells) { minHeight = Mathf.Min(minHeight, (float)c.Height); maxHeight = Mathf.Max(maxHeight, (float)c.Height); }
             CreateMaterials();
             world = new GameObject("FireEscape_ProceduralWorld").transform;
             world.SetParent(transform, false);
             BuildTerrain();
-            BuildObstacles();
             BuildMarkers();
             BuildPerson();
             BuildFires();
@@ -101,12 +107,31 @@ namespace FireEscape
             return material;
         }
 
+        /// <summary>Muted ESA WorldCover legend colours, so the 3D map matches the Python plots.</summary>
+        public static Color TerrainColor(TerrainKind kind)
+        {
+            switch (kind)
+            {
+                case TerrainKind.Forest: return new Color(.16f, .38f, .20f);
+                case TerrainKind.Shrub: return new Color(.62f, .55f, .27f);
+                case TerrainKind.Grass: return new Color(.66f, .69f, .38f);
+                case TerrainKind.Cropland: return new Color(.70f, .55f, .66f);
+                case TerrainKind.BuiltUp: return new Color(.62f, .30f, .28f);
+                case TerrainKind.Bare: return new Color(.60f, .60f, .58f);
+                case TerrainKind.Snow: return new Color(.92f, .93f, .95f);
+                case TerrainKind.Water: return new Color(.16f, .40f, .66f);
+                case TerrainKind.Wetland: return new Color(.20f, .52f, .52f);
+                default: return new Color(.50f, .55f, .45f);
+            }
+        }
+
         private void BuildTerrain()
         {
             float width = (float)(map.Width * map.CellSize);
             float depth = (float)(map.Depth * map.CellSize);
+            float thickness = .65f * unit;
             MakePrimitive("Foundation", PrimitiveType.Cube, world,
-                new Vector3(width / 2, -.38f, depth / 2), new Vector3(width + .4f, .65f, depth + .4f), charcoalMaterial, false);
+                new Vector3(width / 2, minHeight - thickness / 2 - .05f * unit, depth / 2), new Vector3(width + .4f * unit, thickness, depth + .4f * unit), charcoalMaterial, false);
             List<Vector3> vertices = new List<Vector3>();
             List<int> indices = new List<int>();
             List<Color> colours = new List<Color>();
@@ -114,88 +139,29 @@ namespace FireEscape
                 for (int x = 0; x < map.Width; x++)
                 {
                     Cell cell = map.At(x, z);
-                    Color c = cell.Terrain == TerrainKind.Grass ? new Color(.27f, .40f, .31f) :
-                        cell.Terrain == TerrainKind.Rubble ? new Color(.54f, .43f, .30f) : new Color(.32f, .39f, .46f);
-                    if (cell.Exit) c = new Color(.12f, .55f, .38f);
-                    if (cell.Blocked) c = new Color(.19f, .24f, .29f);
-                    if ((x + z) % 2 == 0) c *= .94f;
+                    Color c = TerrainColor(cell.Terrain);
+                    // Blocked land is a cliff or a user obstacle; water keeps its own colour.
+                    if (cell.Blocked && cell.Terrain != TerrainKind.Water) c = new Color(.24f, .22f, .22f);
+                    if (cell.Exit) c = new Color(.12f, .85f, .45f);
                     c.a = 1;
                     AddTile(vertices, indices, colours, x, z, .002f, c);
                 }
             Mesh mesh = NewMesh("TerrainMesh", vertices, indices, colours);
             GameObject floor = MeshObject("TerrainSurface", mesh, surfaceMaterial);
             floor.AddComponent<MeshCollider>().sharedMesh = mesh;
-            // Sparse rubble props make ground type recognisable without obscuring route or heatmap.
-            for (int z = 1; z < map.Depth - 1; z += 2)
-                for (int x = 1; x < map.Width - 1; x += 2)
-                {
-                    Cell cell = map.At(x, z);
-                    if (!cell.Blocked && !cell.Exit && cell.Terrain == TerrainKind.Rubble)
-                    {
-                        Point p = map.Center(map.Index(x, z));
-                        GameObject rock = MakePrimitive("RubbleDetail", PrimitiveType.Cube, world,
-                            Ground(p, .045f), new Vector3(.23f, .09f, .15f), charcoalMaterial, false);
-                        rock.transform.rotation = Quaternion.Euler(0, (x * 31 + z * 19) % 180, 0);
-                    }
-                }
-        }
-
-        private void BuildObstacles()
-        {
-            List<Vector3> vertices = new List<Vector3>();
-            List<int> triangles = new List<int>();
-            List<Color> colours = new List<Color>();
-            for (int z = 0; z < map.Depth; z++)
-                for (int x = 0; x < map.Width; x++)
-                {
-                    Cell c = map.At(x, z);
-                    if (!c.Blocked) continue;
-                    Point p = map.Center(map.Index(x, z));
-                    float bottom = (float)c.Height;
-                    AddBox(vertices, triangles, colours,
-                        new Vector3((float)p.X, bottom + .67f, (float)p.Z),
-                        new Vector3((float)map.CellSize * .99f, 1.34f, (float)map.CellSize * .99f),
-                        new Color(.20f, .28f, .36f));
-                    AddBox(vertices, triangles, colours,
-                        new Vector3((float)p.X, bottom + 1.36f, (float)p.Z),
-                        new Vector3((float)map.CellSize, .04f, (float)map.CellSize),
-                        new Color(.39f, .50f, .59f));
-                }
-            if (vertices.Count > 0) MeshObject("WallsAndObstacles", NewMesh("ObstacleMesh", vertices, triangles, colours), surfaceMaterial);
         }
 
         private void BuildMarkers()
         {
-            Ring("StartPosition", map.Start, .36f, new Color(.25f, .95f, 1f), .05f);
-            for (int z = 0; z < map.Depth; z++)
-                for (int x = 0; x < map.Width; x++)
-                {
-                    Cell c = map.At(x, z);
-                    if (!c.Exit || c.Blocked) continue;
-                    Point p = map.Center(map.Index(x, z));
-                    Ring("ExitArea", p, .39f, new Color(.25f, 1, .58f), .065f);
-                    Vector3 a = Ground(p, .04f);
-                    MakePrimitive("ExitBeacon", PrimitiveType.Cube, world, a + new Vector3(0, 1.9f, 0),
-                        new Vector3(.7f, .24f, .10f), greenMaterial, false);
-                    // Two thin posts keep doors visually open; the model cell remains traversable.
-                    MakePrimitive("ExitPost", PrimitiveType.Cube, world, a + new Vector3(-.43f, .9f, 0),
-                        new Vector3(.045f, 1.8f, .045f), greenMaterial, false);
-                    MakePrimitive("ExitPost", PrimitiveType.Cube, world, a + new Vector3(.43f, .9f, 0),
-                        new Vector3(.045f, 1.8f, .045f), greenMaterial, false);
-                    TextMesh label = new GameObject("ExitLabel").AddComponent<TextMesh>();
-                    label.transform.SetParent(world, false);
-                    label.transform.position = a + new Vector3(0, 2.17f, 0);
-                    label.transform.rotation = Quaternion.Euler(45f, 0, 0);
-                    label.text = "IZLAZ"; label.anchor = TextAnchor.MiddleCenter;
-                    label.fontSize = 40; label.characterSize = .065f;
-                    label.color = new Color(.55f, 1f, .76f);
-                }
+            // Exits are green terrain cells (often a whole map edge), so they need no objects of their own.
+            Ring("StartPosition", map.Start, 2.5f, new Color(.25f, .95f, 1f), .3f);
         }
 
         private void BuildPerson()
         {
             person = new GameObject("SinglePerson").transform;
             person.SetParent(world, false);
+            person.localScale = Vector3.one * unit;
             MakePrimitive("Torso", PrimitiveType.Capsule, person, new Vector3(0, 1.11f, 0), new Vector3(.43f, .33f, .28f), tealMaterial, false);
             MakePrimitive("Head", PrimitiveType.Sphere, person, new Vector3(0, 1.67f, 0), new Vector3(.29f, .33f, .29f), skinMaterial, false);
             MakePrimitive("Hair", PrimitiveType.Sphere, person, new Vector3(0, 1.79f, -.025f), new Vector3(.30f, .14f, .28f), navyMaterial, false);
@@ -227,24 +193,27 @@ namespace FireEscape
             {
                 Point p = map.FireSources[k];
                 Vector3 ground = Ground(p, 0);
+                // Flames live in a per-fire transform scaled like the person, so local sizes stay in "human" units.
+                Transform source = new GameObject("FireSource").transform;
+                source.SetParent(fireRoot, false); source.position = ground; source.localScale = Vector3.one * unit;
                 for (int j = 0; j < 4; j++)
                 {
                     float angle = j * Mathf.PI * .5f;
-                    Vector3 local = ground + new Vector3(Mathf.Cos(angle) * .21f, .39f + j * .08f, Mathf.Sin(angle) * .21f);
-                    Transform f = MakePrimitive("Flame", PrimitiveType.Sphere, fireRoot, local,
+                    Vector3 local = new Vector3(Mathf.Cos(angle) * .21f, .39f + j * .08f, Mathf.Sin(angle) * .21f);
+                    Transform f = MakePrimitive("Flame", PrimitiveType.Sphere, source, local,
                         new Vector3(.4f, .9f, .4f), j % 2 == 0 ? fireMaterial : flameMaterial, false).transform;
                     flames.Add(f);
                 }
                 Light light = new GameObject("FireLight").AddComponent<Light>();
                 light.transform.SetParent(fireRoot, false);
-                light.transform.position = ground + Vector3.up * 1.1f;
-                light.type = LightType.Point; light.range = 4f; light.intensity = 1.5f;
+                light.transform.position = ground + Vector3.up * 1.1f * unit;
+                light.type = LightType.Point; light.range = 4f * unit; light.intensity = 1.5f;
                 light.color = new Color(1, .39f, .12f); light.shadows = LightShadows.None;
                 for (int j = 0; j < 5; j++)
                 {
                     Transform puff = MakePrimitive("IllustrativeSmoke", PrimitiveType.Sphere, fireRoot,
-                        ground + Vector3.up * (1.6f + j * .5f), Vector3.one, smokeMaterial, false).transform;
-                    smokePuffs.Add(puff); smokeOrigins.Add(ground + new Vector3(.1f * j, 0, .09f * j));
+                        ground + Vector3.up * (1.6f + j * .5f) * unit, Vector3.one * unit, smokeMaterial, false).transform;
+                    smokePuffs.Add(puff); smokeOrigins.Add(ground + new Vector3(.1f * j, 0, .09f * j) * unit);
                 }
             }
         }
@@ -262,7 +231,7 @@ namespace FireEscape
             heatObject = MeshObject("ProbabilityHeatmap", heatMesh, overlayMaterial);
             heatObject.SetActive(false);
             // Offset hazard field slightly below probability overlay.
-            for (int i = 0; i < vertices.Count; i++) vertices[i] -= Vector3.up * .02f;
+            for (int i = 0; i < vertices.Count; i++) vertices[i] -= Vector3.up * .02f * unit;
             hazardMesh = NewMesh("HazardCells", vertices, triangles, colours);
             hazardMesh.MarkDynamic(); hazardColours = colours.ToArray();
             hazardObject = MeshObject("SyntheticHazardField", hazardMesh, overlayMaterial);
@@ -286,7 +255,7 @@ namespace FireEscape
             rightArm.localRotation = Quaternion.Euler(gait * .7f, 0, 7);
             if (status == RunStatus.Incapacitated)
             {
-                person.position = at + Vector3.up * .19f;
+                person.position = at + Vector3.up * .19f * unit;
                 person.rotation = Quaternion.Euler(0, person.eulerAngles.y, 85f);
             }
         }
@@ -306,13 +275,13 @@ namespace FireEscape
             for (int i = 0; i < smokePuffs.Count; i++)
             {
                 float phase = Mathf.Repeat((float)time * .23f + (i % 5) * .2f, 1f);
-                smokePuffs[i].position = smokeOrigins[i] + new Vector3(phase * .5f, 1.3f + phase * 3.1f, phase * .3f);
-                smokePuffs[i].localScale = new Vector3(1.0f, .85f, 1f) * (.5f + phase * 1.8f) * Mathf.Clamp((float)settings.SmokeStrength, .15f, 2f);
+                smokePuffs[i].position = smokeOrigins[i] + new Vector3(phase * .5f, 1.3f + phase * 3.1f, phase * .3f) * unit;
+                smokePuffs[i].localScale = new Vector3(1.0f, .85f, 1f) * (.5f + phase * 1.8f) * Mathf.Clamp((float)settings.SmokeStrength, .15f, 2f) * unit;
                 smokePuffs[i].gameObject.SetActive(settings.SmokeStrength > .001);
             }
             // Sampling cadence affects display only. The core samples hazards each model step.
-            if (Math.Abs(time - lastHazardTime) < .20 && settings.SmokeStrength == lastSmokeStrength && settings.FireGrowth == lastFireGrowth) return;
-            lastHazardTime = time; lastSmokeStrength = settings.SmokeStrength; lastFireGrowth = settings.FireGrowth;
+            if (Math.Abs(time - lastHazardTime) < .20 && SameHazard(settings, lastHazardSettings)) return;
+            lastHazardTime = time; lastHazardSettings = settings.Clone();
             for (int index = 0; index < map.Cells.Length; index++)
             {
                 Color c = Color.clear;
@@ -384,7 +353,7 @@ namespace FireEscape
         {
             if (map == null) return;
             EnsureCameraAndLight();
-            orbit.ResetView((float)(map.Width * map.CellSize), (float)(map.Depth * map.CellSize), topDown);
+            orbit.ResetView((float)(map.Width * map.CellSize), (float)(map.Depth * map.CellSize), minHeight, maxHeight, topDown);
         }
 
         private void EnsureCameraAndLight()
@@ -418,7 +387,7 @@ namespace FireEscape
 
         private Vector3 Ground(Point p, float lift)
         {
-            return new Vector3((float)p.X, (float)map.HeightAt(p) + lift, (float)p.Z);
+            return new Vector3((float)p.X, (float)map.HeightAt(p) + lift * unit, (float)p.Z);
         }
 
         private float CornerHeight(double x, double z)
@@ -431,40 +400,22 @@ namespace FireEscape
         private void AddTile(List<Vector3> vertices, List<int> indices, List<Color> colours, int x, int z, float lift, Color c)
         {
             int offset = vertices.Count;
-            // Include cell centre and edge midpoints: the visual surface agrees with
-            // the bilinear height field at the navigation nodes, including ramp crests.
-            for (int iz = 0; iz < 3; iz++)
-                for (int ix = 0; ix < 3; ix++)
-                {
-                    double px = (x + ix * .5) * map.CellSize;
-                    double pz = (z + iz * .5) * map.CellSize;
-                    vertices.Add(new Vector3((float)px, CornerHeight(px, pz) + lift, (float)pz));
-                    colours.Add(c);
-                }
             for (int iz = 0; iz < 2; iz++)
                 for (int ix = 0; ix < 2; ix++)
                 {
-                    int first = offset + iz * 3 + ix;
-                    indices.Add(first); indices.Add(first + 3); indices.Add(first + 4);
-                    indices.Add(first); indices.Add(first + 4); indices.Add(first + 1);
+                    double px = (x + ix) * map.CellSize;
+                    double pz = (z + iz) * map.CellSize;
+                    vertices.Add(new Vector3((float)px, CornerHeight(px, pz) + lift * unit, (float)pz));
+                    colours.Add(c);
                 }
+            indices.Add(offset); indices.Add(offset + 2); indices.Add(offset + 3);
+            indices.Add(offset); indices.Add(offset + 3); indices.Add(offset + 1);
         }
 
-        private void AddBox(List<Vector3> v, List<int> t, List<Color> c, Vector3 center, Vector3 size, Color colour)
+        private static bool SameHazard(ModelSettings a, ModelSettings b)
         {
-            Vector3 a = center - size * .5f, b = center + size * .5f;
-            Vector3[] corners = {
-                new Vector3(a.x,a.y,a.z),new Vector3(b.x,a.y,a.z),new Vector3(b.x,b.y,a.z),new Vector3(a.x,b.y,a.z),
-                new Vector3(a.x,a.y,b.z),new Vector3(b.x,a.y,b.z),new Vector3(b.x,b.y,b.z),new Vector3(a.x,b.y,b.z)
-            };
-            int[,] faces = { {0,3,2,1}, {5,6,7,4}, {4,7,3,0}, {1,2,6,5}, {3,7,6,2}, {4,0,1,5} };
-            for (int face = 0; face < 6; face++)
-            {
-                int first = v.Count;
-                for (int j = 0; j < 4; j++) { v.Add(corners[faces[face, j]]); c.Add(colour); }
-                t.Add(first); t.Add(first + 1); t.Add(first + 2);
-                t.Add(first); t.Add(first + 2); t.Add(first + 3);
-            }
+            return b != null && a.SmokeStrength == b.SmokeStrength && a.FireGrowth == b.FireGrowth && a.FireStartRadius == b.FireStartRadius
+                && a.SmokeRadius == b.SmokeRadius && a.SmokeGrowth == b.SmokeGrowth;
         }
 
         private Mesh NewMesh(string name, List<Vector3> vertices, List<int> indices, List<Color> colours)
@@ -503,7 +454,8 @@ namespace FireEscape
             GameObject go = new GameObject(name); go.transform.SetParent(parent, false);
             LineRenderer line = go.AddComponent<LineRenderer>();
             line.sharedMaterial = lineMaterial; line.useWorldSpace = true;
-            line.startWidth = width; line.endWidth = width; line.startColor = colour; line.endColor = colour;
+            // Lines are seen from kilometres away, so they are wider than the markers scale alone.
+            line.startWidth = width * unit * 3; line.endWidth = width * unit * 3; line.startColor = colour; line.endColor = colour;
             line.numCapVertices = 3; line.numCornerVertices = 2;
             line.shadowCastingMode = ShadowCastingMode.Off; line.receiveShadows = false;
             return line;
@@ -524,7 +476,7 @@ namespace FireEscape
             for (int i = 0; i < 32; i++)
             {
                 double angle = i * Math.PI * 2 / 32;
-                Point point = new Point(p.X + Math.Cos(angle) * radius, p.Z + Math.Sin(angle) * radius);
+                Point point = new Point(p.X + Math.Cos(angle) * radius * unit, p.Z + Math.Sin(angle) * radius * unit);
                 line.SetPosition(i, Ground(point, .07f));
             }
         }
@@ -536,7 +488,7 @@ namespace FireEscape
             for (int i = 0; i < ownedMeshes.Count; i++) if (ownedMeshes[i] != null) Destroy(ownedMeshes[i]);
             ownedMaterials.Clear(); ownedMeshes.Clear(); flames.Clear(); smokePuffs.Clear(); smokeOrigins.Clear();
             havePreviousPosition = false; facingYaw = 0;
-            lastSmokeStrength = double.NaN; lastFireGrowth = double.NaN;
+            lastHazardSettings = null;
         }
 
         private void OnDestroy() { ClearWorld(); CameraInputBlocked = false; }

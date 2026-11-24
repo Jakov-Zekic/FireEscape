@@ -3,9 +3,9 @@ using System.Collections.Generic;
 
 namespace FireEscape.Core
 {
-    public enum TerrainKind { Floor, Grass, Rubble }
+    /// <summary>Land cover; values are ESA WorldCover class codes, the same as in the Python maps.</summary>
+    public enum TerrainKind { Forest = 10, Shrub = 20, Grass = 30, Cropland = 40, BuiltUp = 50, Bare = 60, Snow = 70, Water = 80, Wetland = 90, Mangrove = 95, Moss = 100 }
     public enum RunStatus { Moving, Evacuated, Incapacitated, TimedOut }
-    public enum ScenarioKind { Baseline, FireDetour, TerrainSlope, BlockedExit }
 
     [Serializable]
     public struct Point
@@ -21,12 +21,15 @@ namespace FireEscape.Core
     {
         public bool Blocked, Exit;
         public double Height;
-        public TerrainKind Terrain;
+        public TerrainKind Terrain = TerrainKind.Grass;
     }
 
     [Serializable]
     public sealed class GridMap
     {
+        public const int MaxSize = 513;
+        public const double MinCellSize = .25, MaxCellSize = 50, MaxAbsHeight = 9000;
+        public string Name = "";
         public int Width, Depth;
         public double CellSize;
         public Cell[] Cells;
@@ -34,8 +37,8 @@ namespace FireEscape.Core
         public List<Point> FireSources;
         public GridMap(int width, int depth, double cellSize = 1)
         {
-            if (width < 2 || depth < 2 || width > 256 || depth > 256 || !ModelMath.Finite(cellSize) || cellSize < .25 || cellSize > 10)
-                throw new ArgumentException("Grid dimensions must be 2..256 and cell size .25..10 metres.");
+            if (width < 2 || depth < 2 || width > MaxSize || depth > MaxSize || !ModelMath.Finite(cellSize) || cellSize < MinCellSize || cellSize > MaxCellSize)
+                throw new ArgumentException("Grid dimensions must be 2.." + MaxSize + " and cell size " + MinCellSize + ".." + MaxCellSize + " metres.");
             Width = width; Depth = depth; CellSize = cellSize;
             Cells = new Cell[width * depth];
             for (int i = 0; i < Cells.Length; i++) Cells[i] = new Cell();
@@ -60,16 +63,16 @@ namespace FireEscape.Core
         }
         public GridMap Clone()
         {
-            var copy = new GridMap(Width, Depth, CellSize) { Start = Start };
+            var copy = new GridMap(Width, Depth, CellSize) { Start = Start, Name = Name };
             for (int i = 0; i < Cells.Length; i++) copy.Cells[i] = new Cell { Blocked = Cells[i].Blocked, Exit = Cells[i].Exit, Height = Cells[i].Height, Terrain = Cells[i].Terrain };
             copy.FireSources.AddRange(FireSources); return copy;
         }
         public void Validate()
         {
-            if (Width < 2 || Depth < 2 || Width > 256 || Depth > 256 || Cells == null || Cells.Length != Width * Depth || !ModelMath.Finite(CellSize) || CellSize < .25 || CellSize > 10)
+            if (Width < 2 || Depth < 2 || Width > MaxSize || Depth > MaxSize || Cells == null || Cells.Length != Width * Depth || !ModelMath.Finite(CellSize) || CellSize < MinCellSize || CellSize > MaxCellSize)
                 throw new ArgumentException("Invalid grid dimensions or cell array.");
             foreach (Cell cell in Cells)
-                if (cell == null || !ModelMath.Finite(cell.Height) || Math.Abs(cell.Height) > 100 || !Enum.IsDefined(typeof(TerrainKind), cell.Terrain)) throw new ArgumentException("Invalid grid cell.");
+                if (cell == null || !ModelMath.Finite(cell.Height) || Math.Abs(cell.Height) > MaxAbsHeight || !Enum.IsDefined(typeof(TerrainKind), cell.Terrain)) throw new ArgumentException("Invalid grid cell.");
             if (!IsWalkable(Start)) throw new ArgumentException("Initial position must be on a walkable cell.");
             if (FireSources == null || FireSources.Count > 100) throw new ArgumentException("Invalid fire source list.");
             foreach (Point p in FireSources) if (CellIndex(p) < 0) throw new ArgumentException("Fire source outside map.");
@@ -80,16 +83,19 @@ namespace FireEscape.Core
     public sealed class ModelSettings
     {
         public double BaseSpeed = 1.35, SpeedSigma = .15, Stress = .3, Familiarity = .75, RiskAversion = 4;
-        public double SmokeStrength = 1, FireGrowth = .035, ReactionDelay = 1, ReactionJitter = 1, DecisionNoise = .15;
-        public double TimeStep = .1, Horizon = 120, SnapshotInterval = 1;
+        public double SmokeStrength = 1, ReactionDelay = 30, ReactionJitter = 15, DecisionNoise = .15;
+        // Landscape-scale synthetic fire: radii in metres, growth in metres per second.
+        public double FireStartRadius = 25, FireGrowth = .15, SmokeRadius = 150, SmokeGrowth = .5;
+        public double TimeStep = .5, Horizon = 1800, SnapshotInterval = 5;
         public int Seed = 12345;
         public ModelSettings Clone() { return (ModelSettings)MemberwiseClone(); }
         public void Validate()
         {
             Check(BaseSpeed, .35, 2.5, "BaseSpeed"); Check(SpeedSigma, 0, 1, "SpeedSigma"); Check(Stress, 0, 1, "Stress");
             Check(Familiarity, 0, 1, "Familiarity"); Check(RiskAversion, 0, 30, "RiskAversion"); Check(SmokeStrength, 0, 10, "SmokeStrength");
-            Check(FireGrowth, 0, .5, "FireGrowth"); Check(ReactionDelay, 0, 120, "ReactionDelay"); Check(ReactionJitter, 0, 120, "ReactionJitter");
-            Check(DecisionNoise, 0, 2, "DecisionNoise"); Check(TimeStep, .01, .25, "TimeStep"); Check(Horizon, 1, 600, "Horizon"); Check(SnapshotInterval, .1, 60, "SnapshotInterval");
+            Check(FireGrowth, 0, 5, "FireGrowth"); Check(ReactionDelay, 0, 900, "ReactionDelay"); Check(ReactionJitter, 0, 900, "ReactionJitter");
+            Check(FireStartRadius, .5, 2000, "FireStartRadius"); Check(SmokeRadius, 1, 5000, "SmokeRadius"); Check(SmokeGrowth, 0, 10, "SmokeGrowth");
+            Check(DecisionNoise, 0, 2, "DecisionNoise"); Check(TimeStep, .01, 2, "TimeStep"); Check(Horizon, 1, 7200, "Horizon"); Check(SnapshotInterval, .1, 60, "SnapshotInterval");
         }
         private static void Check(double x, double low, double high, string name)
         { if (!ModelMath.Finite(x) || x < low || x > high) throw new ArgumentException(name + " must be in [" + low + ", " + high + "]."); }
@@ -129,7 +135,23 @@ namespace FireEscape.Core
     {
         public static bool Finite(double x) { return !double.IsNaN(x) && !double.IsInfinity(x); }
         public static double Clamp(double x, double min, double max) { return Math.Max(min, Math.Min(max, x)); }
-        public static double TerrainFactor(TerrainKind terrain) { return terrain == TerrainKind.Rubble ? .55 : terrain == TerrainKind.Grass ? .8 : 1; }
+        /// <summary>Walking speed factor per land cover; same estimates as KLASE in python/sim/stvarno.py.</summary>
+        public static double TerrainFactor(TerrainKind terrain)
+        {
+            switch (terrain)
+            {
+                case TerrainKind.Forest: return .7;
+                case TerrainKind.Shrub: return .5;
+                case TerrainKind.Grass: return .9;
+                case TerrainKind.Cropland: return .8;
+                case TerrainKind.BuiltUp: return 1;
+                case TerrainKind.Bare: return .9;
+                case TerrainKind.Snow: return .5;
+                case TerrainKind.Wetland: return .3;
+                case TerrainKind.Moss: return .9;
+                default: return .05; // water, mangrove: such cells are blocked anyway
+            }
+        }
         public static double SlopeFactor(double slope) { return Clamp(Math.Exp(-3.5 * (Math.Abs(slope + .05) - .05)), .15, 1.2); }
         public static double DesiredSpeed(double sampledSpeed, double stress, TerrainKind terrain, double slope, double smoke)
         { return Clamp(sampledSpeed * TerrainFactor(terrain) * SlopeFactor(slope) * (1 + .3 * stress) * Math.Max(.15, Math.Exp(-.45 * smoke)), .12, 3.2); }
